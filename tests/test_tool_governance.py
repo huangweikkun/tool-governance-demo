@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from typing import Any
@@ -66,16 +67,37 @@ def approve(approvals: demo.ApprovalStore, arguments: Mapping[str, Any]) -> None
     approvals.approve(APPROVAL_ID, transfer_context(), TRANSFER, dict(arguments))
 
 
+def print_result(result: demo.ToolResult) -> demo.ToolResult:
+    """把 invoke 返回的 ToolResult 原样打印出来，便于观察每一步链路。"""
+
+    print(
+        json.dumps(
+            {
+                "tool_call_id": result.tool_call_id,
+                "tool_name": result.tool_name,
+                "ok": result.ok,
+                "action": result.action,
+                "code": result.code,
+                "content": result.content,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    )
+    return result
+
+
 async def transfer(
     runtime: demo.ToolRuntime,
     tool_call_id: str,
     arguments: Mapping[str, Any],
     **context_overrides: Any,
 ) -> demo.ToolResult:
-    return await runtime.invoke(
+    result = await runtime.invoke(
         demo.ToolCall(tool_call_id, TRANSFER, arguments),
         transfer_context(**context_overrides),
     )
+    return print_result(result)
 
 
 @pytest.fixture(autouse=True)

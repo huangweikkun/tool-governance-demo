@@ -85,7 +85,13 @@ class RunShellArgs(StrictArgs):
     command: str = Field(min_length=1, max_length=200)
 
 
-ArgsModel = GetOrderArgs | CreateRefundArgs | RunShellArgs
+class TransferArgs(StrictArgs):
+    from_account: str = Field(pattern=r"^ACC-[A-Z]-[0-9]{6}$")
+    to_account: str = Field(pattern=r"^ACC-[A-Z]-[0-9]{6}$")
+    amount: float = Field(gt=0, le=100_000)
+
+
+ArgsModel = GetOrderArgs | CreateRefundArgs | RunShellArgs | TransferArgs
 Handler = Callable[[str, ArgsModel, ExecutionContext], Awaitable[Mapping[str, Any]]]
 Precheck = Callable[[ArgsModel, ExecutionContext], Awaitable[None]]
 CanonicalTarget = Callable[[ArgsModel], str]
@@ -289,7 +295,12 @@ def _redact(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_redact(item) for item in value]
     if isinstance(value, str):
-        return re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "***@***", value)
+        value = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "***@***", value)
+        return re.sub(
+            r"ACC-[A-Z]-[0-9]{6}",
+            lambda match: f"{match.group(0)[:6]}****{match.group(0)[-4:]}",
+            value,
+        )
     return value
 
 
@@ -584,6 +595,12 @@ ORDERS = {
         "customer_email": "alice@example.com",
     }
 }
+ACCOUNTS = {
+    ("tenant_a", "ACC-A-123456"): 100000.0,
+    ("tenant_a", "ACC-A-654321"): 5000.0,
+    ("tenant_a", "ACC-A-888888"): 20000.0,
+    ("tenant_b", "ACC-B-111111"): 50000.0,
+}
 SIDE_EFFECTS = {"refund_executions": 0, "shell_executions": 0}
 
 
@@ -632,6 +649,40 @@ async def create_refund_handler(
     }
 
 
+async def transfer_precheck(raw_arguments: ArgsModel, context: ExecutionContext) -> None:
+    arguments = raw_arguments
+    assert isinstance(arguments, TransferArgs)
+    if 50_000 < arguments.amount <= 80_000:
+        raise PolicyDenied("EXCEED_LIMIT", "单笔转账金额超过教学演示限额")
+    balance = ACCOUNTS.get((context.tenant_id, arguments.from_account))
+    if balance is None or balance < arguments.amount:
+        raise PolicyDenied("INSUFFICIENT_BALANCE", "转出账户余额不足")
+
+
+async def transfer_handler(
+    tool_call_id: str,
+    raw_arguments: ArgsModel,
+    context: ExecutionContext,
+) -> Mapping[str, Any]:
+    arguments = raw_arguments
+    assert isinstance(arguments, TransferArgs)
+    if arguments.amount > 80_000:
+        await asyncio.sleep(3.0)
+    from_key = (context.tenant_id, arguments.from_account)
+    to_key = (context.tenant_id, arguments.to_account)
+    if to_key not in ACCOUNTS:
+        raise PolicyDenied("ACCOUNT_NOT_FOUND", "转入账户不存在")
+    ACCOUNTS[from_key] -= arguments.amount
+    ACCOUNTS[to_key] += arguments.amount
+    return {
+        "txn_id": tool_call_id[-6:],
+        "from": arguments.from_account,
+        "to": arguments.to_account,
+        "amount": arguments.amount,
+        "status": "accepted",
+    }
+
+
 async def simulated_shell_handler(
     _tool_call_id: str,
     raw_arguments: ArgsModel,
@@ -667,6 +718,17 @@ def build_tools() -> list[ToolDefinition]:
             canonical_target=lambda args: f"{getattr(args, 'order_id')}:{getattr(args, 'amount')}",
         ),
         ToolDefinition(
+            name="transfer",
+            description="在同一租户内的两个账户之间转账",
+            parameters_model=TransferArgs,
+            policy=ToolPolicy(Effect.WRITE, Risk.HIGH, "transfer:execute", True, 2.0, 0, False),
+            handler=transfer_handler,
+            precheck=transfer_precheck,
+            canonical_target=lambda args: (
+                f"{getattr(args, 'from_account')}:{getattr(args, 'to_account')}:{getattr(args, 'amount')}"
+            ),
+        ),
+        ToolDefinition(
             name="run_shell",
             description="教学用模拟 Shell，不执行真实系统命令",
             parameters_model=RunShellArgs,
@@ -690,8 +752,8 @@ def base_context(**overrides: Any) -> ExecutionContext:
         user_id="u_100",
         tenant_id="tenant_a",
         mode=PermissionMode.DEFAULT,
-        permissions=frozenset({"order:read", "refund:create", "shell:run"}),
-        allowed_tools=frozenset({"get_order", "create_refund", "run_shell"}),
+        permissions=frozenset({"order:read", "refund:create", "shell:run", "transfer:execute"}),
+        allowed_tools=frozenset({"get_order", "create_refund", "run_shell", "transfer"}),
     )
     return replace(context, **overrides)
 
@@ -725,6 +787,27 @@ async def run_offline_demo() -> None:
             replace(context, approval_id="approval_01"),
         )
     )
+    transfer_arguments = {
+        "from_account": "ACC-A-123456",
+        "to_account": "ACC-A-654321",
+        "amount": 1200.0,
+    }
+    over_limit_arguments = {**transfer_arguments, "amount": 60_000.0}
+    short_balance_arguments = {
+        "from_account": "ACC-A-888888",
+        "to_account": "ACC-A-654321",
+        "amount": 30_000.0,
+    }
+    timeout_arguments = {**transfer_arguments, "amount": 90_000.0}
+    approved_transfers = (
+        ("approval_tr_01", transfer_arguments),
+        ("approval_tr_02", over_limit_arguments),
+        ("approval_tr_03", short_balance_arguments),
+        ("approval_tr_04", timeout_arguments),
+    )
+    for approval_id, arguments in approved_transfers:
+        approvals.approve(approval_id, context, "transfer", arguments)
+
     results.extend(
         [
             await runtime.invoke(
@@ -742,6 +825,26 @@ async def run_offline_demo() -> None:
             await runtime.invoke(
                 ToolCall("call_06", "create_refund", refund_arguments),
                 replace(context, mode=PermissionMode.PLAN, approval_id="approval_01"),
+            ),
+            await runtime.invoke(
+                ToolCall("call_07", "transfer", transfer_arguments),
+                context,
+            ),
+            await runtime.invoke(
+                ToolCall("call_08", "transfer", transfer_arguments),
+                replace(context, approval_id="approval_tr_01"),
+            ),
+            await runtime.invoke(
+                ToolCall("call_09", "transfer", over_limit_arguments),
+                replace(context, approval_id="approval_tr_02"),
+            ),
+            await runtime.invoke(
+                ToolCall("call_10", "transfer", short_balance_arguments),
+                replace(context, approval_id="approval_tr_03"),
+            ),
+            await runtime.invoke(
+                ToolCall("call_11", "transfer", timeout_arguments),
+                replace(context, approval_id="approval_tr_04"),
             ),
         ]
     )
