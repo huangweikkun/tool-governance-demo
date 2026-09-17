@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 测试缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# 环境变量与密钥
+.env
+.env.local
+.env.*.local
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+.trae/
+*.swp
